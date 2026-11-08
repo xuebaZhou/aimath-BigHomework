@@ -11,8 +11,8 @@ from torchvision.transforms import ToTensor
 class NoisyMNISTDataset(Dataset):
     """Return (corrupted, clean) images in [0, 1].
 
-    Training redraws noise on every access. Testing uses seed + image index
-    so comparisons use identical corruptions without caching noisy images.
+    Training redraws noise on every access. Deterministic noise uses seed +
+    image index so comparisons use identical corruptions without caching images.
     Each image has samples_per_image virtual slots with independent corruptions.
     Probabilities select one recipe per slot, rather than exact dataset counts.
     """
@@ -57,7 +57,10 @@ class NoisyMNISTDataset(Dataset):
         seed: int = 42,
         samples_per_image: int = 1,
         noise_ranges=None,
+        deterministic_noise=None,
     ):
+        if deterministic_noise is not None and not isinstance(deterministic_noise, bool):
+            raise ValueError("deterministic_noise must be a boolean")
         if (
             isinstance(samples_per_image, bool)
             or not isinstance(samples_per_image, int)
@@ -66,6 +69,7 @@ class NoisyMNISTDataset(Dataset):
             raise ValueError("samples_per_image must be a positive integer")
         self.samples_per_image = samples_per_image
         self.train = train
+        self.deterministic_noise = not train if deterministic_noise is None else deterministic_noise
         self.seed = seed
         self.noise_ranges = dict(self.DEFAULT_NOISE_RANGES)
         if noise_ranges is not None:
@@ -94,9 +98,9 @@ class NoisyMNISTDataset(Dataset):
             raise IndexError("Dataset index out of range")
         # Each source image occupies samples_per_image virtual sample slots.
         img, _ = self.data[idx // self.samples_per_image]
-        generator = (
-            None if self.train else torch.Generator().manual_seed(self.seed + idx)
-        )
+        generator = None
+        if self.deterministic_noise:
+            generator = torch.Generator().manual_seed(self.seed + idx)
         choice = torch.multinomial(self.noise_weights, 1, generator=generator).item()
         noisy_img = self._corrupt(img, self.noise_names[choice], generator)
         return noisy_img.clamp(0, 1), img

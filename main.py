@@ -16,6 +16,12 @@ from torch.utils.data import DataLoader, Subset
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
 
+from ir_sde.classical import (
+    CLASSICAL_CONFIG,
+    CLASSICAL_METHODS,
+    denoise_batch,
+    edge_magnitude_mae,
+)
 from ir_sde.data import NoisyMNISTDataset
 from ir_sde.model import IRSdePipeline, IRSdeScheduler, make_mnist_unet
 
@@ -86,7 +92,8 @@ def evaluate(unet, scheduler, loader, device, steps, seed, image_path):
     pipeline = IRSdePipeline(unet=unet, scheduler=scheduler).to(device)
     pipeline.set_progress_bar_config(disable=True)
     generator = torch.Generator(device=device).manual_seed(seed)
-    noisy_error, restored_error, pixels = 0.0, 0.0, 0
+    noisy_error, restored_error = 0.0, 0.0
+    noisy_edge_error, restored_edge_error, pixels = 0.0, 0.0, 0
     progress = tqdm(loader, desc="Evaluating", unit="batch", dynamic_ncols=True)
     for index, (y, x0) in enumerate(progress):
         y, x0 = y.to(device), x0.to(device)
@@ -95,6 +102,8 @@ def evaluate(unet, scheduler, loader, device, steps, seed, image_path):
             raise RuntimeError("Non-finite restoration; check SDE parameters")
         noisy_error += F.mse_loss(y, x0, reduction="sum").item()
         restored_error += F.mse_loss(restored, x0, reduction="sum").item()
+        noisy_edge_error += edge_magnitude_mae(y, x0) * x0.size(0)
+        restored_edge_error += edge_magnitude_mae(restored, x0) * x0.size(0)
         pixels += x0.numel()
         progress.set_postfix(restored_mse=f"{restored_error / pixels:.6f}")
         if index == 0:
@@ -109,10 +118,86 @@ def evaluate(unet, scheduler, loader, device, steps, seed, image_path):
     return {
         "noisy_mse": noisy_mse,
         "restored_mse": restored_mse,
+        "noisy_edge_mae": noisy_edge_error / (pixels / x0[0].numel()),
         # PSNR from dataset-wide MSE with pixel range [0, 1].
         "noisy_psnr": -10 * torch.tensor(noisy_mse).log10().item(),
         "restored_psnr": -10 * torch.tensor(restored_mse).log10().item(),
+        "restored_edge_mae": restored_edge_error / (pixels / x0[0].numel()),
     }
+
+
+@torch.no_grad()
+def evaluate_classical(loader, image_path):
+    """Evaluate fixed traditional filters on exactly the loader's noisy samples."""
+    noisy_error = 0.0
+    noisy_edge_error = 0.0
+    pixels = 0
+    method_errors = {name: 0.0 for name in CLASSICAL_METHODS}
+    method_edge_errors = {name: 0.0 for name in CLASSICAL_METHODS}
+    progress = tqdm(loader, desc="Evaluating classical baselines", unit="batch")
+    for index, (y, x0) in enumerate(progress):
+        denoised = denoise_batch(y)
+        noisy_error += F.mse_loss(y, x0, reduction="sum").item()
+        noisy_edge_error += edge_magnitude_mae(y, x0) * x0.size(0)
+        pixels += x0.numel()
+        for name, result in denoised.items():
+            method_errors[name] += F.mse_loss(result, x0, reduction="sum").item()
+            method_edge_errors[name] += (
+                edge_magnitude_mae(result, x0) * x0.size(0)
+            )
+        if index == 0:
+            n = min(8, x0.size(0))
+            rows = [x0[:n], y[:n]]
+            rows.extend(denoised[name][:n] for name in CLASSICAL_METHODS)
+            save_image(torch.cat(rows).cpu(), image_path, nrow=n)
+    if pixels == 0:
+        raise ValueError("Classical evaluation loader must not be empty")
+    noisy_mse = noisy_error / pixels
+    samples = pixels / x0[0].numel()
+    return {
+        "noisy_mse": noisy_mse,
+        "noisy_psnr": -10 * torch.tensor(noisy_mse).log10().item(),
+        "noisy_edge_mae": noisy_edge_error / samples,
+        "methods": {
+            name: {
+                "restored_mse": error / pixels,
+                "restored_psnr": -10 * torch.tensor(error / pixels).log10().item(),
+                "restored_edge_mae": method_edge_errors[name] / samples,
+            }
+            for name, error in method_errors.items()
+        },
+    }
+
+
+def save_comparison_csv(ir_sde_metrics, classical_metrics, output):
+    """Write a flat table so methods can be compared outside the script."""
+    rows = [
+        {
+            "method": "noisy",
+            "mse": ir_sde_metrics["noisy_mse"],
+            "psnr": ir_sde_metrics["noisy_psnr"],
+            "edge_mae": ir_sde_metrics["noisy_edge_mae"],
+        },
+        {
+            "method": "IR-SDE",
+            "mse": ir_sde_metrics["restored_mse"],
+            "psnr": ir_sde_metrics["restored_psnr"],
+            "edge_mae": ir_sde_metrics["restored_edge_mae"],
+        },
+    ]
+    rows.extend(
+        {
+            "method": name,
+            "mse": metrics["restored_mse"],
+            "psnr": metrics["restored_psnr"],
+            "edge_mae": metrics["restored_edge_mae"],
+        }
+        for name, metrics in classical_metrics["methods"].items()
+    )
+    with (output / "comparison.csv").open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=["method", "mse", "psnr", "edge_mae"])
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def parse_args():
@@ -216,10 +301,12 @@ def save_history(history, batch_history, output):
         "global_batch",
         "train_noise_mse",
         "train_loss",
-        "test_noisy_mse",
-        "test_restored_mse",
-        "test_noisy_psnr",
-        "test_restored_psnr",
+        "validation_noisy_mse",
+        "validation_restored_mse",
+        "validation_noisy_psnr",
+        "validation_restored_psnr",
+        "validation_noisy_edge_mae",
+        "validation_restored_edge_mae",
     ]
     with (output / "history.json").open("w", encoding="utf-8") as file:
         json.dump(history, file, indent=2)
@@ -263,30 +350,30 @@ def save_history(history, batch_history, output):
             ha="center",
             fontsize=8,
         )
-    evaluated = [r for r in history if "test_restored_mse" in r]
+    evaluated = [r for r in history if "validation_restored_mse" in r]
     steps = [r["global_batch"] for r in evaluated]
     psnr_ax = ax.twinx()
     for kind, color in (("noisy", "tab:gray"), ("restored", "tab:orange")):
         ax.plot(
             steps,
-            [r[f"test_{kind}_mse"] for r in evaluated],
+            [r[f"validation_{kind}_mse"] for r in evaluated],
             marker="o",
             linestyle="--",
             color=color,
-            label=f"Fixed test {kind} MSE",
+            label=f"Fixed validation {kind} MSE",
         )
         psnr_ax.plot(
             steps,
-            [r[f"test_{kind}_psnr"] for r in evaluated],
+            [r[f"validation_{kind}_psnr"] for r in evaluated],
             marker="s",
             linestyle=":",
             color=color,
-            label=f"Fixed test {kind} PSNR",
+            label=f"Fixed validation {kind} PSNR",
         )
     ax.set_xlabel("Global training batch (continuous across epochs)")
     ax.set_ylabel("MSE / training loss")
     psnr_ax.set_ylabel("PSNR (dB)")
-    ax.set_title("Training and fixed test history", pad=30)
+    ax.set_title("Training and fixed validation history", pad=30)
     ax.grid(alpha=0.3)
     lines, labels = ax.get_legend_handles_labels()
     right_lines, right_labels = psnr_ax.get_legend_handles_labels()
@@ -307,13 +394,22 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     noise_ranges = {"gaussian": args.gaussian_sigma,
                     "salt_pepper": args.salt_pepper_amount}
-    train_data = NoisyMNISTDataset(
+    train_source = NoisyMNISTDataset(
         root=args.data_root,
         train=True,
         seed=args.seed,
         samples_per_image=args.samples_per_image,
         noise_probs=args.noise_probs,
         noise_ranges=noise_ranges,
+    )
+    validation_source = NoisyMNISTDataset(
+        root=args.data_root,
+        train=True,
+        seed=args.seed,
+        samples_per_image=args.samples_per_image,
+        noise_probs=args.noise_probs,
+        noise_ranges=noise_ranges,
+        deterministic_noise=True,
     )
     test_data = NoisyMNISTDataset(
         root=args.data_root,
@@ -322,6 +418,29 @@ def main():
         samples_per_image=args.test_samples_per_image,
         noise_probs=args.noise_probs,
         noise_ranges=noise_ranges,
+    )
+    image_count = len(train_source.data)
+    if image_count < 2:
+        raise ValueError("At least two MNIST training images are required")
+    image_order = torch.randperm(
+        image_count, generator=torch.Generator().manual_seed(args.seed)
+    ).tolist()
+    validation_image_count = max(1, round(image_count * 0.1))
+    validation_images = image_order[:validation_image_count]
+    training_images = image_order[validation_image_count:]
+
+    def virtual_indices(image_ids, samples_per_image):
+        return [
+            image_id * samples_per_image + slot
+            for image_id in image_ids
+            for slot in range(samples_per_image)
+        ]
+
+    train_data = Subset(
+        train_source, virtual_indices(training_images, args.samples_per_image)
+    )
+    validation_data = Subset(
+        validation_source, virtual_indices(validation_images, args.samples_per_image)
     )
     if args.train_samples is not None:
         train_data = Subset(train_data, range(min(args.train_samples, len(train_data))))
@@ -341,25 +460,31 @@ def main():
         num_workers=args.num_workers,
         generator=torch.Generator().manual_seed(args.seed),
     )
-    # Fixed indices, corruption seeds and sampling seed keep epoch comparisons fair.
+    # Keep epoch comparisons fixed, and reserve the held-out test split until training ends.
     eval_indices = torch.randperm(
-        len(test_data), generator=torch.Generator().manual_seed(args.seed)
-    )[: min(args.eval_samples, len(test_data))].tolist()
+        len(validation_data), generator=torch.Generator().manual_seed(args.seed)
+    )[: min(args.eval_samples, len(validation_data))].tolist()
     eval_loader = DataLoader(
-        Subset(test_data, eval_indices),
+        Subset(validation_data, eval_indices),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         generator=torch.Generator().manual_seed(args.seed),
     )
+    test_eval_indices = torch.randperm(
+        len(test_data), generator=torch.Generator().manual_seed(args.seed + 1)
+    )[: min(args.eval_samples, len(test_data))].tolist()
     with (output / "fixed_eval.json").open("w", encoding="utf-8") as file:
         json.dump(
             {
-                "indices": eval_indices,
+                "validation_indices": eval_indices,
+                "test_indices": test_eval_indices,
+                "validation_image_ids": validation_images,
                 "seed": args.seed,
                 "noise_probs": args.noise_probs,
                 "inference_steps": args.inference_steps,
                 "test_samples_per_image": args.test_samples_per_image,
+                "validation_samples_per_image": args.samples_per_image,
             },
             file,
             indent=2,
@@ -372,6 +497,10 @@ def main():
                 "noise_probs": args.noise_probs,
                 "noise_ranges": {**NoisyMNISTDataset.DEFAULT_NOISE_RANGES, **noise_ranges},
                 "lr_schedule": "cosine",
+                "classical_baselines": CLASSICAL_CONFIG,
+                "validation_fraction": 0.1,
+                "training_image_count": len(training_images),
+                "validation_image_count": len(validation_images),
             },
             file,
             indent=2,
@@ -385,7 +514,8 @@ def main():
         optimizer, T_max=total_steps, eta_min=0.0
     )
     print(
-        f"Device: {device}; train: {len(train_data)}; test: {len(test_data)}",
+        f"Device: {device}; train: {len(train_data)}; "
+        f"validation: {len(validation_data)}; test: {len(test_data)}",
         flush=True,
     )
     print(f"Noise probabilities: {args.noise_probs}", flush=True)
@@ -423,10 +553,10 @@ def main():
                 output / f"comparison_epoch_{epoch:04d}.png",
             )
             history[-1].update(
-                {f"test_{key}": value for key, value in fixed_metrics.items()}
+                {f"validation_{key}": value for key, value in fixed_metrics.items()}
             )
             print(
-                f"Fixed test: MSE = {fixed_metrics['restored_mse']:.6f}, "
+                f"Fixed validation: MSE = {fixed_metrics['restored_mse']:.6f}, "
                 f"PSNR = {fixed_metrics['restored_psnr']:.2f} dB",
                 flush=True,
             )
@@ -454,6 +584,8 @@ def main():
         args.seed,
         output / "comparison.png",
     )
+    classical_metrics = evaluate_classical(test_loader, output / "comparison_classical.png")
+    save_comparison_csv(metrics, classical_metrics, output)
     unet.save_pretrained(output / "unet")
     scheduler.save_pretrained(output / "scheduler")
     per_noise = {}
@@ -464,15 +596,32 @@ def main():
             root=args.data_root, train=False, noise_probs={kind: 1.0}, seed=args.seed,
             samples_per_image=args.test_samples_per_image, noise_ranges=noise_ranges,
         )
-        loader = DataLoader(Subset(dataset, eval_indices), batch_size=args.batch_size,
+        loader = DataLoader(Subset(dataset, test_eval_indices), batch_size=args.batch_size,
                             generator=torch.Generator().manual_seed(args.seed))
-        per_noise[kind] = evaluate(
+        per_noise_ir_sde = evaluate(
             unet, scheduler, loader, device, args.inference_steps,
             args.seed, output / f"comparison_{kind}.png",
         )
+        per_noise_classical = evaluate_classical(
+            loader, output / f"comparison_classical_{kind}.png"
+        )
+        per_noise[kind] = {
+            "ir_sde": per_noise_ir_sde,
+            "classical": per_noise_classical["methods"],
+        }
     with (output / "metrics.json").open("w", encoding="utf-8") as file:
-        json.dump({"history": history, **metrics, "per_noise": per_noise}, file, indent=2)
+        json.dump(
+            {
+                "history": history,
+                **metrics,
+                "classical": classical_metrics["methods"],
+                "per_noise": per_noise,
+            },
+            file,
+            indent=2,
+        )
     print(json.dumps(metrics, indent=2), flush=True)
+    print(json.dumps(classical_metrics["methods"], indent=2), flush=True)
     print(f"Saved results to {output.resolve()}")
 
 

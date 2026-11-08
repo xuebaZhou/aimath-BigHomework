@@ -1,0 +1,5 @@
+diffusers==0.36.0
+matplotlib>=3.5
+numpy>=1.23
+scipy>=1.8
+tqdm>=4.64
