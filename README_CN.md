@@ -23,7 +23,7 @@ $$
 | Gaussian（高斯滤波） | 高斯平滑，标准差为 0.7 像素，作为简单平滑基线。 |
 | Median（中值滤波） | 3×3 次序统计滤波，常用于脉冲噪声。 |
 | Bilateral（双边滤波） | 半径 2、灰度标准差 0.1；同时按空间距离和像素灰度差加权，旨在保留边缘。 |
-| TV（全变分去噪） | 权重 0.08，Chambolle 迭代 30 次；近似求解 $0.5\,\lVert x-y\rVert_2^2+\text{weight}\cdot\operatorname{TV}(x)$。 |
+| TV（全变分去噪） | 权重 0.08，Chambolle 迭代 30 次；近似求解 \(0.5\,\lVert x-y\rVert_2^2+\text{weight}\cdot\mathrm{TV}(x)\)。 |
 
 报告包括像素保真度指标 MSE、PSNR，以及 Sobel 边缘幅值平均绝对误差（Edge MAE），三项指标均为越低越好。`comparison.png` 和 `comparison_classical.png` 展示干净目标、含噪输入及恢复结果；经典方法对比图的行顺序与上表一致。指标和可视化可辅助比较，但不能单独证明纹理得到保留。
 
